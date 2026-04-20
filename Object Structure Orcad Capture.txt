@@ -1,0 +1,78 @@
+  OrCAD Capture Object Tree with Types
+
+
+   * Type `1`: DboDesign
+       * Description: The top-level object representing the entire design (.dsn file).
+       * Contains: A collection of DboSchematic objects.
+
+
+   * Type `3`: DboSchematic
+       * Description: Represents a single schematic folder within a design.
+       * Contains: A collection of DboPage objects.
+
+
+   * Type `4`: DboPage
+       * Description: A single schematic page.
+       * Contains: A collection of all items placed on the page, including:
+           * Type `66`: DboInstOccurrence
+               * Description: This is your key object. It represents a physically placed component part 
+					(e.g., a specific resistor R77725 on the page).
+			   * Refers To:
+                   * Type `65`: DboPartInst
+                       * Description: The logical definition of the part. 
+					     A collection of properties (Reference, Part Number, etc.).
+					     For example, if you have 20 resistors of the same type (RES-00381), 
+						 they will all be unique DboInstOccurrence objects, but
+                         they will all point to the same single DboPartInst object that defines what a RES-00381 is.
+					   * Refers To:
+						   * Type `60`: DboPin
+                           * Description: It holds generic information about a pin that is common to all instances of that component
+						     , such as:
+								* Pin Name: (e.g., 'VCC', 'GND', 'DATA_IN', 'CLK')
+								* Pin Number/Designator: (e.g., '1', '2', 'A1', 'B2')
+								* Electrical Type: (e.g., Input, Output, Bi-directional, Power, Passive, Open Collector)   
+								* Graphical Properties: Its shape, location relative to the component body in the schematic symbol, and visibility settings.
+				   * Type `68`: DboPinOccurrence
+					   * Description: Represents a single pin on a DboInstOccurrence (e.g., pin 1 of R77725).
+					   * Connects to: A DboNet.
+               * Contains:
+                   * A collection of properties (Reference, Part Number, etc.).
+                   * A collection of DboPinOccurrence objects.
+
+           * Type `23`: DboNet
+               * Description: Represents a wire or a signal path that connects component pins.
+
+           * Type `21`: DboText
+               * Description: A free-standing text block on the schematic.
+
+
+           * Type `18`: DboLine
+               * Description: A simple graphical line, not a net.
+
+           * Type `26`: DboPort
+               * Description: A hierarchical port used to connect schematics.
+
+
+           * Type `27`: DboOffPageConnector
+               * Description: An off-page connector used to continue a net on another page.
+
+  ---
+
+  Logical vs. Physical Objects
+
+  It's also useful to know the distinction between an "Instance" and an "Occurrence":
+
+
+   * Type `65`: DboPartInst
+       * Description: A logical instance of a part in the design's cache. 
+	   For example, if you have 50 resistors of the same type, there might only be one DboPartInst for them.
+
+
+   * Type `66`: DboInstOccurrence
+       * Description: A physical placement of a DboPartInst on the schematic. 
+	   Each of the 50 resistors would have its own unique DboInstOccurrence.
+
+
+  This list covers the primary objects used for navigating a design's connectivity and components. 
+  For a complete list, the official Cadence documentation, specifically the "OrCAD Capture Tcl/Tk
+  Extensions Reference," is the definitive source.
