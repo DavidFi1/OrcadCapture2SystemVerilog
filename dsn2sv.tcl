@@ -105,13 +105,166 @@ proc process_off_page_connectors {lPage lStatus} {
             set OffPageName [DboTclHelper_sGetConstCharPtr $lOffPageNameCS]
             set sanitizedOffPageName [sanitize_name $OffPageName]
             print_debug "    Found Off-Page: '$sanitizedOffPageName' -> Name: '$OffPageName'"
-            dict set ports $sanitizedOffPageName "    inout    $sanitizedOffPageName"
+            dict set ports $sanitizedOffPageName [FormatModulePort inout $sanitizedOffPageName]
 
             set lOffPage [$lOffPageIter NextOffPageConnector $lStatus]
         }
         delete_DboPageOffPageConnectorsIter $lOffPageIter
     }
     return $ports
+}
+
+# FormatModulePort: Formats a SystemVerilog module port declaration string.
+# Ports use the analog interface modports: in, out, in_out.
+proc FormatModulePort {direction portName} {
+    switch $direction {
+        input  { return "    analog.in $portName" }
+        output { return "    analog.out $portName" }
+        inout  { return "    analog.in_out $portName" }
+        default { return "    $direction $portName" }
+    }
+}
+
+# WriteAnalogInterface: Writes the analog interface definition to a generated file.
+proc WriteAnalogInterface {fid} {
+    puts $fid "typedef real voltage;"
+    puts $fid ""
+    puts $fid "// Naming the interface exactly \"analog\""
+    puts $fid "interface analog;"
+    puts $fid "    voltage value;"
+    puts $fid ""
+    puts $fid "    modport out ("
+    puts $fid "        output value"
+    puts $fid "    );"
+    puts $fid ""
+    puts $fid "    modport in ("
+    puts $fid "        input value"
+    puts $fid "    );"
+    puts $fid ""
+    puts $fid "    modport in_out ("
+    puts $fid "        input value"
+    puts $fid "    );"
+    puts $fid ""
+    puts $fid "    modport net ("
+    puts $fid "        inout value"
+    puts $fid "    );"
+    puts $fid "endinterface"
+    puts $fid ""
+}
+
+# CombineVectorPorts: Merges ports that share a base name and direction into one
+# combined vector range, e.g. AN[1:24] and AN[25:30] -> AN[1:30].
+proc CombineVectorPorts {ports} {
+    set scalars [dict create]
+    set groups [dict create]
+
+    dict for {portName portDecl} $ports {
+        set modport "unknown"
+        if {[regexp {analog\.in_out} $portDecl]} {
+            set modport "in_out"
+        } elseif {[regexp {analog\.out} $portDecl]} {
+            set modport "out"
+        } elseif {[regexp {analog\.in} $portDecl]} {
+            set modport "in"
+        }
+
+        set parsed 0
+        if {[regexp {^(\w+)\[(\d+):(\d+)\]$} $portName -> base b1 b2]} {
+            set low  [expr {($b1 < $b2) ? $b1 : $b2}]
+            set high [expr {($b1 > $b2) ? $b1 : $b2}]
+            set ascending [expr {$b1 < $b2}]
+            set parsed 1
+        } elseif {[regexp {^(\w+)\[(\d+)\]$} $portName -> base idx]} {
+            set low $idx
+            set high $idx
+            set ascending 1
+            set parsed 1
+        }
+
+        if {$parsed} {
+            set groupKey "${base}:${modport}"
+            if {![dict exists $groups $groupKey]} {
+                dict set groups $groupKey [list $low $high $ascending]
+            } else {
+                lassign [dict get $groups $groupKey] curLow curHigh curAsc
+                set newLow  [expr {($low  < $curLow)  ? $low  : $curLow}]
+                set newHigh [expr {($high > $curHigh) ? $high : $curHigh}]
+                dict set groups $groupKey [list $newLow $newHigh $curAsc]
+            }
+            print_debug "CombineVectorPorts: grouped '$portName' into '$groupKey' range $low:$high"
+        } else {
+            dict set scalars $portName $portDecl
+        }
+    }
+
+    set combined $scalars
+    dict for {groupKey rangeData} $groups {
+        lassign $rangeData low high ascending
+        set base [lindex [split $groupKey :] 0]
+        set modport [lindex [split $groupKey :] 1]
+
+        if {$low eq $high} {
+            set combinedName "${base}\[${low}\]"
+        } elseif {$ascending} {
+            set combinedName "${base}\[${low}:${high}\]"
+        } else {
+            set combinedName "${base}\[${high}:${low}\]"
+        }
+
+        switch $modport {
+            in     { set direction input }
+            out    { set direction output }
+            in_out { set direction inout }
+            default { set direction input }
+        }
+        dict set combined $combinedName [FormatModulePort $direction $combinedName]
+        print_debug "CombineVectorPorts: merged group '$groupKey' -> '$combinedName'"
+    }
+
+    return $combined
+}
+
+# ParseSignalRange: Returns {kind base low high} for vector-like signal names.
+proc ParseSignalRange {signalName} {
+    if {[regexp {^(\w+)\[(\d+):(\d+)\]$} $signalName -> base b1 b2]} {
+        set low  [expr {($b1 < $b2) ? $b1 : $b2}]
+        set high [expr {($b1 > $b2) ? $b1 : $b2}]
+        return [list vector $base $low $high]
+    }
+    if {[regexp {^(\w+)\[(\d+)\]$} $signalName -> base idx]} {
+        return [list vector $base $idx $idx]
+    }
+    if {[regexp {^([a-zA-Z_]+)(\d+)$} $signalName -> base idx]} {
+        return [list vector $base $idx $idx]
+    }
+    return [list scalar $signalName]
+}
+
+# NetCoveredByPort: Returns 1 if netName matches a module port exactly or lies
+# within a port vector range (e.g. net AN[25:30] covered by port AN[1:30]).
+proc NetCoveredByPort {netName ports} {
+    set sanitized [sanitize_name $netName]
+    if {[dict exists $ports $sanitized]} {
+        return 1
+    }
+
+    lassign [ParseSignalRange $sanitized] netKind netBase netLow netHigh
+    if {$netKind eq "scalar"} {
+        return 0
+    }
+
+    dict for {portName portDecl} $ports {
+        lassign [ParseSignalRange $portName] portKind portBase portLow portHigh
+        if {$portKind eq "scalar"} {
+            continue
+        }
+        if {$netBase eq $portBase &&
+            $netLow  >= $portLow &&
+            $netHigh <= $portHigh} {
+            return 1
+        }
+    }
+    return 0
 }
 
 proc process_globals {lPage lStatus} {
@@ -126,7 +279,7 @@ proc process_globals {lPage lStatus} {
             print_debug "process_globals GlobalName: $GlobalName "
             set formattedGlobalName [sanitize_name $GlobalName]
 
-            dict set ports $formattedGlobalName "    input    $formattedGlobalName"
+            dict set ports $formattedGlobalName [FormatModulePort input $formattedGlobalName]
 
             set lGlobal [$lGlobalsIter NextGlobal $lStatus]
         }
@@ -163,7 +316,7 @@ proc process_hierarchical_ports {lPage lStatus} {
             set lPortName   [DboTclHelper_sGetConstCharPtr $lPortNameCS]
             set formattedPortName [sanitize_name $lPortName]
             
-            set sv_port_string "    $lPortDirectionString    $formattedPortName"
+            set sv_port_string [FormatModulePort $lPortDirectionString $formattedPortName]
             dict set ports $formattedPortName $sv_port_string
  
             set lPort [$lPortsIter NextPort $lStatus]
@@ -226,12 +379,13 @@ proc CollectComponentData {lPage status lDesign} {
 
             # Determine module name (primitive vs. hierarchical)
             set moduleName ""
-            if {![$lPartInst IsPrimitive $status]} {
+            set isPrimitive [$lPartInst IsPrimitive $status]
+            set childPagesList {}
+            if {!$isPrimitive} {
                 print_debug "    Instance '$concatenatedRefDes' is a hierarchical block."
                 set lChildView [$lPartInst GetContents $status]
                 if {$lChildView != "NULL"} {
                     set lChildSchematic [DboViewToDboSchematic $lChildView]
-                    set childPagesList {}
                     if {![catch {$lChildSchematic NewPagesIter $status} lChildPagesIter]} {
                         set lChildPage [$lChildPagesIter NextPage $status]
                         while {$lChildPage != "NULL"} {
@@ -312,10 +466,27 @@ proc CollectComponentData {lPage status lDesign} {
                 delete_DboPartInstPinsIter $lPinsIter
             }
 
-            # add to pins_connections_map the global pins of the page in an hirarchial component
+            # Add global nets for hierarchical components.
+            # For each pointed child page, expose globals as synthetic pin connections.
+            if {!$isPrimitive && [llength $childPagesList] > 0} {
+                foreach lChildPage $childPagesList {
+                    set childGlobals [process_globals $lChildPage $status]
+                    dict for {globalNetName globalNetData} $childGlobals {
+                        set globalDirection [lindex $globalNetData 0]
+                        if {$globalDirection == ""} {
+                            set globalDirection "input"
+                        }
+                        set globalPinIdentifier [sanitize_name "GLOBAL_${globalNetName}"]
+                        dict set pins_connections_map $globalPinIdentifier \
+                            [list $globalPinIdentifier $globalDirection $globalNetName]
+                        print_debug "    Added hierarchical global net: $globalPinIdentifier ($globalDirection)-> net: $globalNetName"
+                    }
+                }
+            }
             
             lappend final_instances [dict create \
-                module_name $moduleName \
+                module_name      $moduleName \
+                is_primitive     $isPrimitive \
                 ref_designator   [sanitize_name $concatenatedRefDes  ] \
                 instance_name    [sanitize_name $concatenatedRefDes  ] \
                 pins_connections [dict values   $pins_connections_map] \
@@ -386,18 +557,22 @@ proc CollectComponentData {lPage status lDesign} {
 #       nets                      nets                      
 #       all_instances             all_instances             
 #       block_pages_for_recursion block_pages_for_recursion 
-proc CollectPageData {lPage status lDesign} {
-    print_debug "inside CollectPageData"
+proc CollectPageData {lPage status lDesign {skipGlobals 0}} {
+    print_debug "inside CollectPageData (skipGlobals=$skipGlobals)"
 
     set all_ports  [dict create]
     set temp_ports [process_hierarchical_ports  $lPage $status]
     dict for {k v} $temp_ports { dict set all_ports $k $v }
 
-    set temp_ports [process_globals             $lPage $status]
-    dict for {k v} $temp_ports { dict set all_ports $k $v }
+    if {!$skipGlobals} {
+        set temp_ports [process_globals $lPage $status]
+        dict for {k v} $temp_ports { dict set all_ports $k $v }
+    }
 
     set temp_ports [process_off_page_connectors $lPage $status]
     dict for {k v} $temp_ports { dict set all_ports $k $v }
+
+    set all_ports [CombineVectorPorts $all_ports]
     
     set sorted_port_names [lsort -unique [dict keys $all_ports]]
 
@@ -518,9 +693,11 @@ proc Wires2VectorsAndScalars {signal_list} {
 
 # GenerateSvForPage: Generates a SystemVerilog module file for a single schematic page.
 # Arguments:
-#   lPage  - The DboPage object for which to generate the SV file.
-#   status - The DboState object for API calls.
-proc GenerateSvForPage {lPage status pageData} {
+#   lPage           - The DboPage object for which to generate the SV file.
+#   status          - The DboState object for API calls.
+#   pageData        - Collected page data dictionary.
+#   writeInterface  - If 1, write the analog interface definition (top module only).
+proc GenerateSvForPage {lPage status pageData {writeInterface 0}} {
     print_debug "inside GenerateSvForPage - Page object: $lPage"
 
     # Get and sanitize the page name for use as a module name and filename
@@ -543,9 +720,14 @@ proc GenerateSvForPage {lPage status pageData} {
         print_debug "Successfully opened file: $filePath"
     }
     
-    # Write header comment
+    # Write header comment; analog interface only on the top module
     puts $fid "// Generated from page: $pageName\n"
-    print_debug "DBG-2: After writing header comment."
+    if {$writeInterface} {
+        WriteAnalogInterface $fid
+        print_debug "DBG-2: After writing analog interface on top module."
+    } else {
+        print_debug "DBG-2: After writing header comment."
+    }
 
     # Write module header with port declarations
     set port_declarations [list]
@@ -584,9 +766,9 @@ proc GenerateSvForPage {lPage status pageData} {
         print_debug "DBG-8.$net_counter: Processing net '$net_name'."
         set sanitized_net_name [sanitize_name $net_name]
         print_debug "DBG-8.$net_counter: Sanitized net name: '$sanitized_net_name'."
-        if {![dict exists $ports $sanitized_net_name]} { 
-            puts $fid "    wire $sanitized_net_name;"
-            print_debug "DBG-8.$net_counter: Wrote wire declaration."
+        if {![NetCoveredByPort $sanitized_net_name $ports]} { 
+            puts $fid "    analog.net $sanitized_net_name;"
+            print_debug "DBG-8.$net_counter: Wrote analog.net declaration."
 
         } else {
             print_debug "DBG-8.$net_counter: Net '$sanitized_net_name' is already a port. Skipping wire declaration."
@@ -635,6 +817,21 @@ proc GenerateSvForPage {lPage status pageData} {
         foreach instance_data $sorted_instances_of_module {
             set moduleName [dict get $instance_data module_name  ]
             set instName   [dict get $instance_data instance_name]
+            set isPrimitive [expr {[dict exists $instance_data is_primitive] ? [dict get $instance_data is_primitive] : 1}]
+            set pins_list [dict get $instance_data pins_connections]
+
+            set hasIoPins 0
+            foreach pin_data $pins_list {
+                set direction [lindex $pin_data 1]
+                if {$direction in {input output inout}} {
+                    set hasIoPins 1
+                    break
+                }
+            }
+            if {!$isPrimitive && !$hasIoPins} {
+                print_debug "Skipping empty hierarchical block without inputs/outputs: '$instName' ($moduleName)"
+                continue
+            }
             
             if {$instName eq "" || $instName eq "unnamed"} {
                 set instName "unnamed_instance_[incr ::unnamed_counter]"
@@ -642,7 +839,6 @@ proc GenerateSvForPage {lPage status pageData} {
 
             puts $fid "    $moduleName $instName ("
             set pin_connections_formatted [list]
-            set pins_list [dict get $instance_data pins_connections]
             print_debug "DBG-11: Processing instance '$instName' pins:"
 
             foreach pin_data $pins_list {
@@ -676,7 +872,7 @@ proc GenerateSvForPage {lPage status pageData} {
 # Arguments:
 #   lPage   - The DboPage object representing the current schematic page to process and traverse from.
 #   lDesign - The DboDesign object.
-proc TraverseAndGenerate {lPage lDesign} {
+proc TraverseAndGenerate {lPage lDesign {skipGlobals 0} {writeInterface 0}} {
     set debugPageNameCStr [DboTclHelper_sMakeCString]
     $lPage GetName $debugPageNameCStr
     set pageNameForTracking [DboTclHelper_sGetConstCharPtr $debugPageNameCStr]
@@ -692,18 +888,18 @@ proc TraverseAndGenerate {lPage lDesign} {
     print_debug "Processing Page : $pageNameForTracking."
     
     # Collect all data for the current page
-    set pageData    [CollectPageData $lPage [DboState] $lDesign]
+    set pageData    [CollectPageData $lPage [DboState] $lDesign $skipGlobals]
     print_debug "Got CollectPageData from Page : $pageNameForTracking."
 
     # Generate the SystemVerilog module for the current page.
-    GenerateSvForPage $lPage [DboState] $pageData
+    GenerateSvForPage $lPage [DboState] $pageData $writeInterface
     print_debug "finished GenerateSvForPage of : $pageNameForTracking."
 
     # Find all hierarchical blocks on this page and recursively process their linked child pages.
     set blockPages [dict get $pageData block_pages_for_recursion]
     foreach blockPageTuple $blockPages {
         set childPage [lindex $blockPageTuple 1]
-        TraverseAndGenerate $childPage $lDesign
+        TraverseAndGenerate $childPage $lDesign 0 0
     }
 }
 
@@ -781,8 +977,12 @@ proc RunSvGeneration {} {
         print_debug "Number of root pages found: [llength $pagesList]"
         
         # Start the hierarchical traversal for each page found in the root schematic.
+        # Skip global nets as module inputs on the top-level first page only.
+        # Write the analog interface definition on the top-level first page only.
+        set isFirstRootPage 1
         foreach lPage $pagesList {
-            TraverseAndGenerate $lPage $lDesign
+            TraverseAndGenerate $lPage $lDesign $isFirstRootPage $isFirstRootPage
+            set isFirstRootPage 0
         }
 
         puts "SystemVerilog generation complete."
